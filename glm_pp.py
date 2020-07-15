@@ -1,34 +1,25 @@
+# usage for debugging with gdb:
+# gdb -x gdb_prettyprinter.py bin/*your_executable*
+# (gdb) break *linenumber*
+# (gdb) run
+# (gdb) print *name_of_the_variable*
+
 import gdb.printing
+import numpy
 
 _type_letters = {
-    gdb.TYPE_CODE_FLT: "d", # or "f"
-    gdb.TYPE_CODE_INT: "i",
-    gdb.TYPE_CODE_BOOL: "b"
+    "float": "",
+    "double": "d",
+    "int": "i",
+    "bool": "b"
 }
 
 def _vec_info(v):
-    # vec contains either a union of structs or a struct of unions, depending on
-    # configuration. gdb can't properly access the named members, and in some
-    # cases the names are wrong.
-    # It would be simple to cast to an array, similarly to how operator[] is
-    # implemented, but values returned by functions called from gdb don't have
-    # an address.
-    # Instead, recursively find all fields of required type and sort by offset.
-    T = v.type.template_argument(0)
-    letter = _type_letters.get(T.code, "t")
-    length = v.type.sizeof // T.sizeof
-    items = {}
-    def find(v, bitpos):
-        t = v.type.strip_typedefs()
-        if t.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
-            for f in t.fields():
-                if hasattr(f, "bitpos"): # not static
-                    find(v[f], bitpos + f.bitpos)
-        elif t == T:
-            items[bitpos] = v
-    find(v, 0)
-    assert len(items) == length
-    items = [str(f) for k, f in sorted(items.items())]
+    length = v.type.template_argument(0)
+    T = v.type.template_argument(1)
+    letter = _type_letters.get(str(T), "t")
+    V = v.address.cast(T.array(length-1).pointer()).dereference()
+    items = list(float(V[i]) for i in range(length))
     return letter, length, items
 
 class VecPrinter:
@@ -37,7 +28,19 @@ class VecPrinter:
 
     def to_string(self):
         letter, length, items = _vec_info(self.v)
-        return "{}vec{}({})".format(letter, length, ", ".join(items))
+        with numpy.printoptions(precision=3, suppress=True):
+            return "{}vec{}: {}".format(letter, length, str(numpy.array(items)))
+
+    def children(self):
+        length = self.v.type.template_argument(0)
+        T = self.v.type.template_argument(1)
+        p = self.v.address.cast(T.pointer())
+        for i in range(length):
+            yield '[{}]'.format(i), (p + i).dereference()
+
+    def display_hint(self):
+        return 'array'
+
 
 class MatPrinter:
     def __init__(self, v):
@@ -48,17 +51,30 @@ class MatPrinter:
         columns = []
         for i in range(V.type.range()[1] + 1):
             letter, length, items = _vec_info(V[i])
-            columns.append("({})".format(", ".join(items)))
-        return "{}mat{}x{}({})".format(
-            letter, len(columns), length, ", ".join(columns))
+            columns.append(items)
+        with numpy.printoptions(precision=3, suppress=True):
+            return "{}mat{}x{}: \n{}".format(
+                letter, len(columns), length, str(numpy.matrix(columns)))
+
+    def children(self):
+        V = self.v["value"]
+        for i in range(V.type.range()[1] + 1):
+            v = V[i]
+            length = v.type.template_argument(0)
+            T = v.type.template_argument(1)
+            p = v.address.cast(T.array(length-1).pointer())
+            with numpy.printoptions(precision=3, suppress=True):
+                yield '[{}]'.format(i), p.dereference()
+
+    def display_hint(self):
+        return 'array'
+
 
 def build_pretty_printer():
     pp = gdb.printing.RegexpCollectionPrettyPrinter("glm_pp")
-    pp.add_printer(
-        "glm::vec", r"^glm::(detail::)?tvec\d<[^<>]*>$", VecPrinter)
-    pp.add_printer(
-        "glm::mat", r"^glm::(detail::)?tmat\dx\d<[^<>]*>$", MatPrinter)
+    pp.add_printer("glm::vec", "^glm::vec<[^<>]*>$", VecPrinter)
+    pp.add_printer("glm::mat", "^glm::mat<[^<>]*>$", MatPrinter)
     return pp
 
-gdb.printing.register_pretty_printer(gdb.current_objfile(),
-                                     build_pretty_printer())
+gdb.printing.register_pretty_printer(gdb.current_objfile(), build_pretty_printer())
+print('glm pretty-printing enabled')
